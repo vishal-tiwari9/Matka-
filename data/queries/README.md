@@ -1,4 +1,4 @@
-# Allium Explorer SQL Queries — Credence Protocol
+# Allium Explorer SQL Queries — Matka  Protocol
 
 ## How to Use
 
@@ -7,10 +7,10 @@
 3. Export each result as CSV.
 4. Save each CSV in `data/raw/` with the filename matching the query number:
    - `01_venus_borrower_labels.csv`
-   - `02_bsc_activity_features.csv`
-   - `03_bsc_lending_features.csv`
-   - `04_bsc_defi_features.csv`
-   - `05_bsc_financial_features.csv`
+   - `02_monad_activity_features.csv`
+   - `03_monad_lending_features.csv`
+   - `04_monad_defi_features.csv`
+   - `05_monad_financial_features.csv`
    - `06_crosschain_activity_features.csv`
 5. Do NOT modify the CSVs. The training pipeline (`model/train.py`) will pick them up from `data/raw/`.
 
@@ -18,11 +18,11 @@
 
 | # | File | Purpose | Key Tables | Est. Rows | Est. Runtime |
 |---|------|---------|------------|-----------|-------------|
-| 01 | `01_venus_borrower_labels.sql` | Build labeled dataset: all Venus borrowers + liquidation flag | `bsc.lending.loans`, `bsc.lending.repayments`, `bsc.lending.liquidations` | 10K–100K | < 1 min |
-| 02 | `02_bsc_activity_features.sql` | BSC on-chain activity (tx count, wallet age, active days) | `bsc.raw.transactions` | Same as Q01 | 1–10 min |
-| 03 | `03_bsc_lending_features.sql` | Venus lending behavior (borrow/repay counts, ratios, duration) | `bsc.lending.loans`, `bsc.lending.repayments` | Same as Q01 | < 1 min |
-| 04 | `04_bsc_defi_features.sql` | DeFi sophistication (DEX, bridge, protocol diversity) | `crosschain.dex.trades`, `crosschain.bridges.transfers` | Same as Q01 | 1–5 min |
-| 05 | `05_bsc_financial_features.sql` | Financial profile (balances, stablecoin ratio, net flow) | `bsc.assets.fungible_balances_latest`, `crosschain.assets.transfers` | Same as Q01 | 1–5 min |
+| 01 | `01_venus_borrower_labels.sql` | Build labeled dataset: all Venus borrowers + liquidation flag | `monad.lending.loans`, `monad.lending.repayments`, `monad.lending.liquidations` | 10K–100K | < 1 min |
+| 02 | `02_monad_activity_features.sql` | BSC on-chain activity (tx count, wallet age, active days) | `monad.raw.transactions` | Same as Q01 | 1–10 min |
+| 03 | `03_monad_lending_features.sql` | Venus lending behavior (borrow/repay counts, ratios, duration) | `monad.lending.loans`, `monad.lending.repayments` | Same as Q01 | < 1 min |
+| 04 | `04_monad_defi_features.sql` | DeFi sophistication (DEX, bridge, protocol diversity) | `crosschain.dex.trades`, `crosschain.bridges.transfers` | Same as Q01 | 1–5 min |
+| 05 | `05_monad_financial_features.sql` | Financial profile (balances, stablecoin ratio, net flow) | `monad.assets.fungible_balances_latest`, `crosschain.assets.transfers` | Same as Q01 | 1–5 min |
 | 06 | `06_crosschain_activity_features.sql` | Crosschain activity (tx counts on ETH/ARB/POLY/OP, DEX trades) | `ethereum.raw.transactions`, `arbitrum.raw.transactions`, `polygon.raw.transactions`, `optimism.raw.transactions`, `crosschain.dex.trades` | Same as Q01 | 5–30 min |
 
 ## Output Schema Reference
@@ -41,7 +41,7 @@
 | `total_repaid_usd` | FLOAT | Lifetime repaid USD |
 | `total_liquidated_usd` | FLOAT | Lifetime liquidated collateral USD |
 
-### Query 02 — BSC Activity Features
+### Query 02 —monad Activity Features
 | Column | Type | Description |
 |--------|------|-------------|
 | `wallet_address` | VARCHAR | Join key |

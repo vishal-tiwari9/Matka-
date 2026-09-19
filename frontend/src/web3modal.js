@@ -20,9 +20,9 @@ const monadTestnet = {
 };
 
 const metadata = {
-  name: 'Credence Protocol',
+  name: 'Matka Protocol',
   description: 'Onchain Credit Scoring & Undercollateralized Lending on Monad',
-  url: 'https://credence-protocol.vercel.app',
+  
   icons: [],
 };
 

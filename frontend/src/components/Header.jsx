@@ -9,7 +9,7 @@ export default function Header({ account, onConnect, onDisconnect, isConnecting,
         className="flex items-center gap-3 hover:opacity-80 transition-opacity cursor-pointer"
         title="Return to home"
       >
-        <img src="/logo.png" alt="Credence" className="w-10 h-10 rounded object-contain" />
+        
         <div className="text-left flex flex-col justify-center">
           <h1 className="text-xl font-bold text-text-primary tracking-tight" style={{ fontFamily: 'var(--font-sans)' }}>
             Matka Protocol

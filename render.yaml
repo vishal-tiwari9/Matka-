@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: credence-protocol-api
+    name: matka-protocol
     runtime: python
     rootDir: .
     buildCommand: pip install -r pipeline/requirements.txt
