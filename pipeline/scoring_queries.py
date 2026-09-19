@@ -1,5 +1,5 @@
 """
-Credence Protocol — Single-Wallet Scoring SQL Queries
+Matka Protocol — Single-Wallet Scoring SQL Queries
 =====================================================
 Two parameterized SQL queries run concurrently via the Allium Explorer API
 to compute all 10 model features for a single wallet address.
@@ -11,7 +11,7 @@ Both use CTE-based aggregation to minimize round trips.
 """
 
 # ──────────────────────────────────────────────────────────────────────────────
-# QUERY A: BSC Features (Venus lending + balances + 90-day net flow)
+# QUERY A: Monad  Features (Venus lending + balances + 90-day net flow)
 # ──────────────────────────────────────────────────────────────────────────────
 # Returns a SINGLE ROW with all BSC features for the given wallet.
 # If the wallet has never used Venus, lending features will be NULL/0.

@@ -6,7 +6,7 @@ import {OffchainAttestationRegistry} from "../src/OffchainAttestationRegistry.so
 import {CreditOracle} from "../src/CreditOracle.sol";
 import {LendingPool} from "../src/LendingPool.sol";
 
-/// @dev Shared fixtures for Credence contract tests.
+/// @dev Shared fixtures for contract tests.
 abstract contract CredenceTestBase is Test {
     address internal admin   = address(0xA11CE);
     address internal alice   = address(0xA1);

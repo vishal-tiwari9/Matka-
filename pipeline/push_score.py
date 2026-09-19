@@ -1,5 +1,5 @@
 """
-Credence Protocol — Push Score to CreditOracle (Monad Testnet)
+Matka Protocol — Push Score to CreditOracle (Monad Testnet)
 ==============================================================
 Pushes an onchain credit score to the deployed CreditOracle contract
 on Monad testnet via web3.py.

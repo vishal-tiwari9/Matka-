@@ -7,6 +7,10 @@ export default function WalletSearch({ onSearch, isLoading, account }) {
   const [resolving, setResolving] = useState(false);
   const [resolvedInfo, setResolvedInfo] = useState(null);
 
+
+
+
+  
   const handleSubmit = async (e) => {
     e.preventDefault();
     const trimmed = input.trim();

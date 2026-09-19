@@ -713,7 +713,7 @@ def write_validation_report(results: dict, df: pd.DataFrame):
 # =============================================================================
 def main():
     print("=" * 60)
-    print("Credence Protocol — Scorecard Model Training")
+    print("Matka Protocol — Scorecard Model Training")
     print("=" * 60)
 
     df = load_data()

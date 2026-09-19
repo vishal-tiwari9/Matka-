@@ -256,6 +256,11 @@ export default function App() {
         </div>
       )}
 
+
+
+
+
+
       {/* Score dashboard */}
       {hasScore && !isScoring && (
         <div className="flex-1 px-6 pb-8">

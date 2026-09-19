@@ -1,5 +1,5 @@
 """
-Credence Protocol — Production Free Multi-Chain Data Fetcher
+Matka Protocol — Production Free Multi-Chain Data Fetcher
 =============================================================
 Uses ONE Etherscan API key across ALL EVM chains + Monad public RPC.
 

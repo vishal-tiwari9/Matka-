@@ -6,7 +6,7 @@ DeFi lending today requires 150%+ collateralization on every loan. Protocols lik
 
 Traditional finance solved this problem decades ago with credit scoring. FICO and VantageScore use logistic regression to predict default probability from historical financial behavior, enabling risk-adjusted lending terms. DeFi has no equivalent with a methodology similar to FICO and VantageScore.
 
-## Solution: Credence Protocol
+## Solution: Matka Protocol
 
 Matka is a two-source composite credit scoring system deployed on BNB Chain. It combines two independent risk signals into a single score that determines collateral requirements on a continuous curve.
 

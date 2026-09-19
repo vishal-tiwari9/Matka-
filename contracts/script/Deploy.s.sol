@@ -7,7 +7,7 @@ import {CreditOracle} from "../src/CreditOracle.sol";
 import {LendingPool} from "../src/LendingPool.sol";
 
 /**
- * @title Deploy — deploys all three Credence Protocol contracts and wires them up.
+ * @title Deploy — deploys all  contracts and wires them up.
  *
  * Usage:
  *   forge script script/Deploy.s.sol:Deploy \

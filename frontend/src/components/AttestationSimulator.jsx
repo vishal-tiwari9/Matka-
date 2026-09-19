@@ -5,6 +5,10 @@ const SLIDER_TRACK =
   'w-full h-1.5 rounded-full appearance-none cursor-pointer bg-border accent-accent';
 
 function SliderField({ label, value, onChange, min, max, suffix = '', step = 1 }) {
+
+
+
+  
   return (
     <div className="space-y-1">
       <div className="flex items-center justify-between">

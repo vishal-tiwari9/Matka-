@@ -1,5 +1,5 @@
 """
-Credence Protocol — Scoring API
+Matka Protocol — Scoring API
 ================================
 FastAPI server exposing a single endpoint:
 
@@ -56,7 +56,7 @@ from model.score import score_wallet
 # ──────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="Credence Protocol Scoring API",
+    title="Matka Protocol Scoring API",
     description="On-demand credit scoring for BNB Chain wallets",
     version="0.1.0",
 )

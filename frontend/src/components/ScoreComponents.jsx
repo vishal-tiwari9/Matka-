@@ -4,6 +4,9 @@
  * that these are inputs, not standalone metrics. When no attestation exists,
  * nudges the user toward the attestation simulator.
  */
+
+
+
 export default function ScoreComponents({
   onchainScore = 0,
   chainsUsed = 1,

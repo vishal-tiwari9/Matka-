@@ -1,6 +1,6 @@
 # AI Build Log
 
-This document chronicles how AI (Claude Code, Anthropic) was used at each phase of the Credence Protocol development. For each phase, we note what the AI generated versus what the human decided, designed, or executed externally.
+This document chronicles how AI (Claude Code, Anthropic) was used at each phase of the Matka Protocol development. For each phase, we note what the AI generated versus what the human decided, designed, or executed externally.
 
 The consistent pattern throughout: AI generates code and proposes designs. Human reviews at checkpoints, makes strategic decisions, executes external steps (Allium queries, wallet setup, deployment configuration), and directs iterative refinement when outputs don't meet the bar.
 

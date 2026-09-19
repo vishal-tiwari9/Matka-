@@ -8,6 +8,9 @@
  *   - Top-decile benchmark comparison
  *   - Action item for improvement
  *
+ * 
+ * 
+ * 
  * Tier direction is domain-informed:
  *   - "experience_positive": more activity = better (flipped from model direction)
  *   - "model_aligned": model reference bin = best (default)

@@ -1,5 +1,5 @@
 """
-Credence Protocol — Pipeline Configuration
+Matka Protocol — Pipeline Configuration
 ===========================================
 Loads environment variables and exposes contract addresses, RPC URLs,
 and API keys used by the scoring pipeline.
