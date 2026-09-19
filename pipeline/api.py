@@ -1,0 +1,816 @@
+"""
+Credence Protocol — Scoring API
+================================
+FastAPI server exposing a single endpoint:
+
+    POST /score
+    Body: {"address": "0x..."}
+
+Tiered data source:
+  Tier 0: Live Allium queries (if ALLIUM_API_KEY is set — ~90s per wallet)
+  Tier 1: Cached real wallet data (from demo_wallets.json — instant)
+  Tier 2: Deterministic synthetic features from address hash (instant)
+
+The model runs on every request regardless of data source. The score is
+pushed to the CreditOracle on BSC testnet. The response includes a
+`data_source` field: "live", "cached", or "synthetic".
+
+Usage:
+    uvicorn pipeline.api:app --host 0.0.0.0 --port 8000 --reload
+"""
+
+import sys
+import time
+import json
+import hashlib
+import traceback
+from pathlib import Path
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import asyncio
+import queue
+import requests as http_requests
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+
+# Add project root for imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from pipeline.config import (
+    ALLIUM_API_KEY,
+    ALLIUM_API_BASE,
+    ALLIUM_MAX_ROWS,
+    ALLIUM_POLL_INTERVAL,
+    ALLIUM_POLL_TIMEOUT,
+)
+from pipeline.scoring_queries import build_query_a, build_query_b
+from pipeline.push_score import push_onchain_score, read_composite_score
+from pipeline.free_fetcher import fetch_wallet_features_free
+from model.score import score_wallet
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FastAPI App
+# ──────────────────────────────────────────────────────────────────────────────
+
+app = FastAPI(
+    title="Credence Protocol Scoring API",
+    description="On-demand credit scoring for BNB Chain wallets",
+    version="0.1.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Rate Limiting (in-memory, hackathon-grade)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_rate_limit_per_ip: dict[str, list[float]] = defaultdict(list)
+_rate_limit_global: list[float] = []
+RATE_LIMIT_PER_IP_HOUR = 20
+RATE_LIMIT_GLOBAL_DAY = 100
+
+# Activity tier penalty multipliers (applied after model inference, before contract push)
+NO_LENDING_PENALTY = 0.6    # Has onchain activity but zero Venus interactions
+THIN_LENDING_PENALTY = 0.8  # Has Venus interactions but < 2 active lending days
+
+
+def _check_rate_limit(client_ip: str):
+    """Raise HTTP 429 if rate limits are exceeded."""
+    now = time.time()
+    hour_ago = now - 3600
+    day_ago = now - 86400
+
+    # Clean up old entries
+    _rate_limit_per_ip[client_ip] = [t for t in _rate_limit_per_ip[client_ip] if t > hour_ago]
+    _rate_limit_global[:] = [t for t in _rate_limit_global if t > day_ago]
+
+    if len(_rate_limit_per_ip[client_ip]) >= RATE_LIMIT_PER_IP_HOUR:
+        raise HTTPException(429, "Scoring rate limit reached. Please try again in a few minutes.")
+    if len(_rate_limit_global) >= RATE_LIMIT_GLOBAL_DAY:
+        raise HTTPException(429, "Scoring rate limit reached. Please try again in a few minutes.")
+
+    _rate_limit_per_ip[client_ip].append(now)
+    _rate_limit_global.append(now)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Request / Response models
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ScoreRequest(BaseModel):
+    address: str = Field(..., description="Wallet address (0x hex string)")
+
+
+class FactorItem(BaseModel):
+    feature: str
+    display_name: str
+    bin: str
+    coefficient: float
+    is_reference: bool
+
+
+class ScoreResponse(BaseModel):
+    address: str
+    credit_score: int
+    raw_model_score: int | None = None  # score before activity penalty
+    chains_used: int
+    data_completeness: str
+    data_source: str = "live"  # "live", "cached", or "synthetic"
+    activity_tier: str = "full_history"  # "no_activity", "no_lending_history", "thin_lending_history", "full_history"
+    activity_note: str | None = None
+    factor_breakdown: list[FactorItem]
+    composite_score: int | None = None
+    collateral_ratio_bps: int | None = None
+    tx_hash: str | None = None
+    error: str | None = None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Activity tier classification and score penalties
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _classify_activity_tier(raw_features: dict) -> tuple[str, str | None, float]:
+    """
+    Classify wallet activity level and return (tier, note, penalty_multiplier).
+
+    Tiers:
+      no_activity         — zero activity across all chains (score → 0, don't push)
+      no_lending_history  — has general activity but zero Venus interactions
+      thin_lending_history — has Venus interactions but < 2 active lending days
+      full_history        — meaningful lending history (2+ active days)
+    """
+    lending_days = raw_features.get("lending_active_days", 0)
+    repay_count = raw_features.get("repay_count", 0)
+    borrow_ratio = raw_features.get("borrow_repay_ratio", 0)
+    crosschain_tx = raw_features.get("crosschain_total_tx_count", 0)
+    has_bridge = raw_features.get("has_used_bridge", 0)
+
+    # Check if there's any onchain activity at all
+    has_any_activity = (
+        lending_days > 0
+        or repay_count > 0
+        or crosschain_tx > 0
+        or has_bridge > 0
+        or raw_features.get("current_total_usd", 0) > 0
+    )
+
+    if not has_any_activity:
+        return "no_activity", "No onchain activity found.", 0.0
+
+    # Check for lending history
+    has_lending = lending_days > 0 or repay_count > 0 or borrow_ratio > 0
+
+    if not has_lending:
+        return (
+            "no_lending_history",
+            "Score based on general onchain activity only. No borrowing history found.",
+            NO_LENDING_PENALTY,
+        )
+
+    if lending_days < 2:
+        return (
+            "thin_lending_history",
+            "Limited borrowing history. Score will improve with additional lending activity.",
+            THIN_LENDING_PENALTY,
+        )
+
+    return "full_history", None, 1.0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Demo fallback: cached wallets + synthetic features
+# ──────────────────────────────────────────────────────────────────────────────
+
+_demo_wallets_cache: dict | None = None
+
+
+def _load_demo_wallets() -> dict:
+    """Load cached real wallet features from demo_wallets.json (loaded once)."""
+    global _demo_wallets_cache
+    if _demo_wallets_cache is not None:
+        return _demo_wallets_cache
+
+    demo_path = Path(__file__).parent / "demo_wallets.json"
+    if demo_path.exists():
+        with open(demo_path) as f:
+            _demo_wallets_cache = json.load(f)
+    else:
+        _demo_wallets_cache = {}
+    return _demo_wallets_cache
+
+
+def _generate_synthetic_features(address: str) -> dict:
+    """
+    Generates a Hybrid profile:
+    Fetches REAL basic data (Transaction Count & Native Balance) from Monad Public RPC
+    and mixes it with deterministic synthetic data for advanced features.
+    Works for ANY wallet instantly without API keys!
+    """
+    import requests as req
+    rpc_url = "https://testnet-rpc.monad.xyz"
+    
+    real_tx_count = 0
+    real_balance_usd = 0.0
+    
+    try:
+        # Fetch Real Transaction Count (Nonce)
+        nonce_resp = req.post(rpc_url, json={"jsonrpc":"2.0","method":"eth_getTransactionCount","params":[address,"latest"],"id":1}, timeout=3)
+        if nonce_resp.status_code == 200:
+            real_tx_count = int(nonce_resp.json().get("result", "0x0"), 16)
+            
+        # Fetch Real Balance
+        bal_resp = req.post(rpc_url, json={"jsonrpc":"2.0","method":"eth_getBalance","params":[address,"latest"],"id":1}, timeout=3)
+        if bal_resp.status_code == 200:
+            wei_bal = int(bal_resp.json().get("result", "0x0"), 16)
+            # Convert to fake USD (assume 1 MON = $50 for demo)
+            real_balance_usd = (wei_bal / 1e18) * 50.0
+    except Exception:
+        pass # Silently fallback to full synthetic if RPC fails
+        
+    h = hashlib.sha256(address.lower().encode()).digest()
+    
+    return {
+        "lending_active_days": (h[0] % 30) + 1 if real_tx_count > 5 else 0,
+        "borrow_repay_ratio": round(0.5 + (h[1] % 150) / 100, 2),
+        "repay_count": (h[2] % 20) if real_tx_count > 10 else 0,
+        "unique_borrow_tokens": (h[3] % 3) + 1,
+        "current_total_usd": real_balance_usd if real_balance_usd > 0 else float(h[4] * h[5]),
+        "stablecoin_ratio": round((h[6] % 100) / 100, 2),
+        "net_flow_usd_90d": float((h[7] - 128) * 100),
+        "crosschain_total_tx_count": real_tx_count if real_tx_count > 0 else (h[8] * h[9]),
+        "crosschain_dex_trade_count": (h[10] * 2) if real_tx_count > 0 else 0,
+        "chains_active_on": (h[11] % 5) + 1,
+        "has_used_bridge": 1 if h[12] > 128 else 0,
+    }
+
+
+def _try_fallback(address: str) -> tuple[dict, str, int, str]:
+    """
+    Tier 1: Check demo_wallets.json for cached real features.
+    Tier 2: Generate deterministic synthetic features from address hash.
+    """
+    cached = _load_demo_wallets()
+    addr_lower = address.lower()
+
+    if addr_lower in cached:
+        entry = cached[addr_lower]
+        return (
+            entry["features"],
+            entry.get("data_completeness", "5-chain history (cached)"),
+            entry.get("chains_used", 5),
+            "cached",
+        )
+
+    features = _generate_synthetic_features(address)
+    chains = 1 + features["chains_active_on"]
+    return features, "synthetic profile", chains, "synthetic"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Allium Explorer API helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+ALLIUM_HEADERS = {
+    "X-API-KEY": ALLIUM_API_KEY,
+    "Content-Type": "application/json",
+}
+
+
+def _run_allium_query(sql: str, label: str, start_delay: float = 0) -> dict | None:
+    """
+    Create → run → poll → fetch results for a single SQL query.
+    Returns the first row as a dict, or None if no rows or error.
+    """
+    if start_delay > 0:
+        time.sleep(start_delay)
+
+    try:
+        for attempt in range(3):
+            resp = http_requests.post(
+                f"{ALLIUM_API_BASE}/queries",
+                headers=ALLIUM_HEADERS,
+                json={
+                    "title": f"credence_live_{label}_{int(time.time())}",
+                    "config": {"sql": sql, "limit": ALLIUM_MAX_ROWS},
+                },
+                timeout=30,
+            )
+            if resp.status_code == 429:
+                wait = 5 * (attempt + 1)
+                print(f"  [{label}] Rate limited (429), retrying in {wait}s...")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            break
+        else:
+            print(f"  [{label}] Rate limited after 3 retries")
+            return None
+        query_id = resp.json().get("query_id") or resp.json().get("id")
+
+        for attempt in range(3):
+            resp = http_requests.post(
+                f"{ALLIUM_API_BASE}/queries/{query_id}/run-async",
+                headers=ALLIUM_HEADERS,
+                json={"parameters": {}, "run_config": {"limit": ALLIUM_MAX_ROWS}},
+                timeout=30,
+            )
+            if resp.status_code == 429:
+                wait = 5 * (attempt + 1)
+                print(f"  [{label}] Rate limited on run (429), retrying in {wait}s...")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            break
+        else:
+            print(f"  [{label}] Rate limited on run after 3 retries")
+            return None
+        run_id = resp.json().get("run_id") or resp.json().get("id")
+
+        start = time.time()
+        while time.time() - start < ALLIUM_POLL_TIMEOUT:
+            resp = http_requests.get(
+                f"{ALLIUM_API_BASE}/query-runs/{run_id}/results",
+                headers={"X-API-KEY": ALLIUM_API_KEY},
+                params={"f": "json"},
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                raw = resp.text
+                if raw and raw.strip() != "null" and len(raw) > 10:
+                    data = resp.json()
+                    if data and isinstance(data, dict) and data.get("data"):
+                        rows = data["data"]
+                        return rows[0] if rows else None
+            time.sleep(ALLIUM_POLL_INTERVAL)
+
+        print(f"[{label}] Timed out after {ALLIUM_POLL_TIMEOUT}s")
+        return None
+
+    except Exception as e:
+        print(f"[{label}] Error: {e}")
+        traceback.print_exc()
+        return None
+
+
+def _query_wallet_features(address: str) -> tuple[dict, str, int]:
+    """Run Query A (BSC) and Query B (crosschain) concurrently."""
+    sql_a = build_query_a(address)
+    sql_b = build_query_b(address)
+
+    results = {"a": None, "b": None}
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        future_a = pool.submit(_run_allium_query, sql_a, "bsc", 0)
+        future_b = pool.submit(_run_allium_query, sql_b, "crosschain", 3)
+
+        for future in as_completed([future_a, future_b]):
+            if future == future_a:
+                results["a"] = future.result()
+            else:
+                results["b"] = future.result()
+
+    if results["a"] is None:
+        raise RuntimeError("BSC data query failed. Falling back to demo mode.")
+
+    a = results["a"]
+    b = results["b"]
+
+    raw = {
+        "lending_active_days": int(a.get("lending_active_days", 0) or 0),
+        "borrow_repay_ratio": float(a.get("borrow_repay_ratio", 0) or 0),
+        "repay_count": int(a.get("repay_count", 0) or 0),
+        "unique_borrow_tokens": max(int(a.get("unique_borrow_tokens", 0) or 0), 1),
+        "current_total_usd": float(a.get("current_total_usd", 0) or 0),
+        "stablecoin_ratio": float(a.get("stablecoin_ratio", 0) or 0),
+        "net_flow_usd_90d": float(a.get("net_flow_usd_90d", 0) or 0),
+    }
+
+    if b is not None:
+        raw["crosschain_total_tx_count"] = int(b.get("crosschain_total_tx_count", 0) or 0)
+        raw["crosschain_dex_trade_count"] = int(b.get("crosschain_dex_trade_count", 0) or 0)
+        raw["chains_active_on"] = int(b.get("chains_active_on", 0) or 0)
+        raw["has_used_bridge"] = int(b.get("has_used_bridge", 0) or 0)
+        chains_used = 1 + raw["chains_active_on"]
+        completeness = f"{chains_used}-chain history"
+    else:
+        raw["crosschain_total_tx_count"] = 0
+        raw["crosschain_dex_trade_count"] = 0
+        raw["chains_active_on"] = 0
+        raw["has_used_bridge"] = 0
+        chains_used = 1
+        completeness = "BNB Chain only (crosschain data unavailable)"
+
+    return raw, completeness, chains_used
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main endpoint
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.post("/score", response_model=ScoreResponse)
+async def score_endpoint(req: ScoreRequest, request: Request):
+    """
+    Score a wallet: query data → run model → push to CreditOracle → return.
+    Data source is tiered: live Allium → cached → synthetic.
+    """
+    address = req.address.strip()
+    if not address.startswith("0x") or len(address) != 42:
+        raise HTTPException(400, "Invalid address format (expected 0x + 40 hex chars)")
+
+    # Rate limiting
+    client_ip = request.client.host if request.client else "unknown"
+    _check_rate_limit(client_ip)
+
+    print(f"\n{'='*60}")
+    print(f"Scoring wallet: {address}")
+    print(f"{'='*60}")
+
+    # Fast path: return cached response instantly for demo wallets
+    cached = _load_demo_wallets()
+    if address.lower() in cached and "cached_response" in cached[address.lower()]:
+        print("  [CACHE HIT] Returning pre-computed response instantly")
+        return ScoreResponse(**cached[address.lower()]["cached_response"])
+
+    # Step 1: Get features (tiered: live → cached → synthetic)
+    t0 = time.time()
+    data_source = "live"
+
+    # Step 1: Get features
+    # Priority:
+    #   Tier 0: Free Multi-chain fetcher (Monad RPC + Etherscan + public RPCs) — works for ANY wallet
+    #   Tier 1: Allium (if key available — richer DeFi data)
+    #   Tier 2: demo_wallets.json cache
+    #   Tier 3: Pure synthetic fallback
+
+    if ALLIUM_API_KEY:
+        # Allium available — use it for richer data
+        try:
+            raw_features, completeness, chains_used = _query_wallet_features(address)
+            data_source = "live"
+        except RuntimeError:
+            print("  [1/3] Allium failed, using free multi-chain fetcher")
+            try:
+                raw_features, completeness, chains_used = fetch_wallet_features_free(address)
+                data_source = "live"  # Still real data!
+            except Exception:
+                raw_features, completeness, chains_used, data_source = _try_fallback(address)
+    else:
+        # No Allium key — use free multi-chain fetcher (works for EVERYONE)
+        print("  [1/3] Using free multi-chain fetcher (Monad RPC + public APIs)")
+        try:
+            raw_features, completeness, chains_used = fetch_wallet_features_free(address)
+            data_source = "live"  # Real blockchain data!
+        except Exception as e:
+            print(f"  [1/3] Free fetcher failed ({e}), falling back to synthetic")
+            raw_features, completeness, chains_used, data_source = _try_fallback(address)
+
+    t_query = time.time() - t0
+    print(f"  [1/3] Features ready in {t_query:.1f}s (source: {data_source})")
+    print(f"        Data completeness: {completeness}")
+
+    # Step 2: Run the frozen model (always real, regardless of data source)
+    t1 = time.time()
+    try:
+        result = score_wallet(raw_features)
+    except Exception as e:
+        raise HTTPException(500, f"Model inference failed: {e}")
+    raw_model_score = result["credit_score"]
+    t_model = time.time() - t1
+    print(f"  [2/3] Model inference in {t_model*1000:.0f}ms → raw score {raw_model_score}")
+
+    # Step 2b: Apply activity tier penalty
+    activity_tier, activity_note, penalty = _classify_activity_tier(raw_features)
+    credit_score = max(0, int(raw_model_score * penalty))
+    if activity_tier == "no_activity":
+        credit_score = 0
+    print(f"        Activity tier: {activity_tier} (penalty: {penalty}x) → adjusted score {credit_score}")
+
+    # Step 3: Push score to CreditOracle (skip if no activity)
+    tx_hash = None
+    composite = None
+    collateral_bps = None
+    push_error = None
+
+    if activity_tier == "no_activity":
+        # Don't push a zero score for wallets with no activity
+        print("  [3/3] Skipped push (no onchain activity)")
+        breakdown = [
+            FactorItem(
+                feature=f["feature"],
+                display_name=f["display_name"],
+                bin=f["bin"],
+                coefficient=f["coefficient"],
+                is_reference=f["is_reference"],
+            )
+            for f in result["factor_breakdown"]
+        ]
+        return ScoreResponse(
+            address=address,
+            credit_score=0,
+            raw_model_score=raw_model_score,
+            chains_used=chains_used,
+            data_completeness=completeness,
+            data_source=data_source,
+            activity_tier=activity_tier,
+            activity_note=activity_note,
+            factor_breakdown=breakdown,
+        )
+
+    t2 = time.time()
+    try:
+        tx_hash = push_onchain_score(address, credit_score, chains_used)
+        print(f"  [3/3] Pushed to CreditOracle: tx {tx_hash}")
+
+        profile = read_composite_score(address)
+        composite = profile["composite_score"]
+
+        from pipeline.config import LENDING_POOL_ADDRESS, get_pool_abi
+        from web3 import Web3
+        from pipeline.push_score import get_web3
+        w3 = get_web3()
+        pool_contract = w3.eth.contract(
+            address=Web3.to_checksum_address(LENDING_POOL_ADDRESS),
+            abi=get_pool_abi(),
+        )
+        collateral_bps = pool_contract.functions.getBorrowerCollateralRatioBps(
+            Web3.to_checksum_address(address)
+        ).call()
+
+        print(f"        On-chain composite: {composite}")
+        print(f"        Collateral ratio: {collateral_bps} bps ({collateral_bps/100:.1f}%)")
+    except Exception as e:
+        push_error = str(e)
+        print(f"  [3/3] Push failed: {push_error}")
+
+    t_push = time.time() - t2
+    t_total = time.time() - t0
+    print(f"  Total time: {t_total:.1f}s (data={t_query:.1f}s, model={t_model*1000:.0f}ms, push={t_push:.1f}s)")
+
+    # Build response — no Allium details, SQL, or API keys exposed
+    breakdown = [
+        FactorItem(
+            feature=f["feature"],
+            display_name=f["display_name"],
+            bin=f["bin"],
+            coefficient=f["coefficient"],
+            is_reference=f["is_reference"],
+        )
+        for f in result["factor_breakdown"]
+    ]
+
+    return ScoreResponse(
+        address=address,
+        credit_score=credit_score,
+        raw_model_score=raw_model_score,
+        chains_used=chains_used,
+        data_completeness=completeness,
+        data_source=data_source,
+        activity_tier=activity_tier,
+        activity_note=activity_note,
+        factor_breakdown=breakdown,
+        composite_score=composite,
+        collateral_ratio_bps=collateral_bps,
+        tx_hash=tx_hash,
+        error=push_error,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Streaming endpoint (SSE) — real-time progress updates
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _sse_event(data: dict) -> str:
+    """Format a single SSE event."""
+    return f"data: {json.dumps(data)}\n\n"
+
+
+@app.post("/score/stream")
+async def score_stream(req: ScoreRequest, request: Request):
+    """
+    Same as /score but returns Server-Sent Events with real-time progress.
+    Events emitted:
+      - {event: "bsc_start"}
+      - {event: "crosschain_start"}
+      - {event: "bsc_done"}
+      - {event: "crosschain_done"}
+      - {event: "model_done", score: N}
+      - {event: "push_start"}
+      - {event: "push_done"}
+      - {event: "result", data: {full ScoreResponse}}
+      - {event: "error", message: "..."}
+    """
+    address = req.address.strip()
+    if not address.startswith("0x") or len(address) != 42:
+        async def error_gen():
+            yield _sse_event({"event": "error", "message": "Invalid address format"})
+        return StreamingResponse(error_gen(), media_type="text/event-stream")
+
+    # Fast path: return cached response instantly for demo wallets
+    cached = _load_demo_wallets()
+    if address.lower() in cached and "cached_response" in cached[address.lower()]:
+        print(f"  [CACHE HIT] Returning pre-computed response instantly for {address}")
+        cached_resp = cached[address.lower()]["cached_response"]
+        async def cached_gen():
+            yield _sse_event({"event": "start", "address": address})
+            yield _sse_event({"event": "bsc_start"})
+            yield _sse_event({"event": "bsc_done"})
+            yield _sse_event({"event": "crosschain_start"})
+            yield _sse_event({"event": "crosschain_done"})
+            yield _sse_event({"event": "queries_complete", "data_source": "cached"})
+            yield _sse_event({"event": "model_done", "score": cached_resp["credit_score"], "raw_score": cached_resp.get("raw_model_score"), "activity_tier": cached_resp.get("activity_tier", "full_history")})
+            yield _sse_event({"event": "result", "data": cached_resp})
+        return StreamingResponse(cached_gen(), media_type="text/event-stream")
+
+    client_ip = request.client.host if request.client else "unknown"
+    try:
+        _check_rate_limit(client_ip)
+    except HTTPException as e:
+        async def error_gen():
+            yield _sse_event({"event": "error", "message": e.detail})
+        return StreamingResponse(error_gen(), media_type="text/event-stream")
+
+    progress_q: queue.Queue = queue.Queue()
+
+    async def generate():
+        yield _sse_event({"event": "start", "address": address})
+
+        # Determine data source tier
+        if ALLIUM_API_KEY:
+            # Tier 0: Live Allium — run both queries concurrently with progress events
+            sql_a = build_query_a(address)
+            sql_b = build_query_b(address)
+
+            def run_bsc():
+                progress_q.put(("bsc_start", {}))
+                result = _run_allium_query(sql_a, "bsc", 0)
+                progress_q.put(("bsc_done", {}))
+                return result
+
+            def run_crosschain():
+                progress_q.put(("crosschain_start", {}))
+                result = _run_allium_query(sql_b, "crosschain", 3)
+                progress_q.put(("crosschain_done", {}))
+                return result
+
+            loop = asyncio.get_event_loop()
+            pool = ThreadPoolExecutor(max_workers=2)
+            bsc_future = pool.submit(run_bsc)
+            xchain_future = pool.submit(run_crosschain)
+
+            # Poll for progress events until both futures complete
+            while not (bsc_future.done() and xchain_future.done()):
+                try:
+                    evt_type, evt_data = progress_q.get(timeout=0.3)
+                    yield _sse_event({"event": evt_type, **evt_data})
+                except queue.Empty:
+                    pass
+                await asyncio.sleep(0.1)
+
+            # Drain remaining events
+            while not progress_q.empty():
+                evt_type, evt_data = progress_q.get_nowait()
+                yield _sse_event({"event": evt_type, **evt_data})
+
+            pool.shutdown(wait=False)
+
+            a = bsc_future.result()
+            b = xchain_future.result()
+
+            if a is None:
+                # Allium failed — fall through to demo mode
+                yield _sse_event({"event": "fallback", "reason": "Allium query timed out"})
+                raw_features, completeness, chains_used, data_source = _try_fallback(address)
+            else:
+                data_source = "live"
+                raw_features = {
+                    "lending_active_days": int(a.get("lending_active_days", 0) or 0),
+                    "borrow_repay_ratio": float(a.get("borrow_repay_ratio", 0) or 0),
+                    "repay_count": int(a.get("repay_count", 0) or 0),
+                    "unique_borrow_tokens": max(int(a.get("unique_borrow_tokens", 0) or 0), 1),
+                    "current_total_usd": float(a.get("current_total_usd", 0) or 0),
+                    "stablecoin_ratio": float(a.get("stablecoin_ratio", 0) or 0),
+                    "net_flow_usd_90d": float(a.get("net_flow_usd_90d", 0) or 0),
+                }
+                if b is not None:
+                    raw_features["crosschain_total_tx_count"] = int(b.get("crosschain_total_tx_count", 0) or 0)
+                    raw_features["crosschain_dex_trade_count"] = int(b.get("crosschain_dex_trade_count", 0) or 0)
+                    raw_features["chains_active_on"] = int(b.get("chains_active_on", 0) or 0)
+                    raw_features["has_used_bridge"] = int(b.get("has_used_bridge", 0) or 0)
+                    chains_used = 1 + raw_features["chains_active_on"]
+                    completeness = f"{chains_used}-chain history"
+                else:
+                    raw_features.update({"crosschain_total_tx_count": 0, "crosschain_dex_trade_count": 0, "chains_active_on": 0, "has_used_bridge": 0})
+                    chains_used = 1
+                    completeness = "BNB Chain only"
+        else:
+            # Demo mode — instant fallback
+            yield _sse_event({"event": "bsc_start"})
+            yield _sse_event({"event": "bsc_done"})
+            yield _sse_event({"event": "crosschain_start"})
+            yield _sse_event({"event": "crosschain_done"})
+            raw_features, completeness, chains_used, data_source = _try_fallback(address)
+
+        yield _sse_event({"event": "queries_complete", "data_source": data_source})
+
+        # Model inference
+        yield _sse_event({"event": "model_start"})
+        try:
+            result = score_wallet(raw_features)
+        except Exception as e:
+            yield _sse_event({"event": "error", "message": f"Model inference failed: {e}"})
+            return
+
+        raw_model_score = result["credit_score"]
+        activity_tier, activity_note, penalty = _classify_activity_tier(raw_features)
+        credit_score = max(0, int(raw_model_score * penalty))
+        if activity_tier == "no_activity":
+            credit_score = 0
+
+        yield _sse_event({"event": "model_done", "score": credit_score, "raw_score": raw_model_score, "activity_tier": activity_tier})
+
+        # Push to contract
+        tx_hash = None
+        composite = None
+        collateral_bps = None
+        push_error = None
+
+        if activity_tier != "no_activity":
+            yield _sse_event({"event": "push_start"})
+            try:
+                tx_hash = push_onchain_score(address, credit_score, chains_used)
+                profile = read_composite_score(address)
+                composite = profile["composite_score"]
+
+                from pipeline.config import LENDING_POOL_ADDRESS, get_pool_abi
+                from web3 import Web3
+                from pipeline.push_score import get_web3
+                w3 = get_web3()
+                pool_contract = w3.eth.contract(
+                    address=Web3.to_checksum_address(LENDING_POOL_ADDRESS),
+                    abi=get_pool_abi(),
+                )
+                collateral_bps = pool_contract.functions.getBorrowerCollateralRatioBps(
+                    Web3.to_checksum_address(address)
+                ).call()
+                yield _sse_event({"event": "push_done", "tx_hash": tx_hash})
+            except Exception as e:
+                push_error = str(e)
+                yield _sse_event({"event": "push_done", "error": push_error})
+
+        # Final result
+        breakdown = [
+            {
+                "feature": f["feature"],
+                "display_name": f["display_name"],
+                "bin": f["bin"],
+                "coefficient": f["coefficient"],
+                "is_reference": f["is_reference"],
+            }
+            for f in result["factor_breakdown"]
+        ]
+
+        yield _sse_event({
+            "event": "result",
+            "data": {
+                "address": address,
+                "credit_score": credit_score,
+                "raw_model_score": raw_model_score,
+                "chains_used": chains_used,
+                "data_completeness": completeness,
+                "data_source": data_source,
+                "activity_tier": activity_tier,
+                "activity_note": activity_note,
+                "factor_breakdown": breakdown,
+                "composite_score": composite,
+                "collateral_ratio_bps": collateral_bps,
+                "tx_hash": tx_hash,
+                "error": push_error,
+            },
+        })
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Health check
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "model_loaded": True,
+        "allium_configured": bool(ALLIUM_API_KEY),
+        "oracle_configured": bool(
+            __import__("pipeline.config", fromlist=["CREDIT_ORACLE_ADDRESS"]).CREDIT_ORACLE_ADDRESS
+        ),
+    }

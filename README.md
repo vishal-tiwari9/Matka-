@@ -1,0 +1,53 @@
+<p align="center">
+  <img src="docs/Credence_Logo_public.jpeg" alt="Credence Protocol" width="400" />
+</p>
+
+# Credence Protocol
+
+**[Live Demo](https://credence-protocol.vercel.app/)** — no setup required. Note that the backend is running on a free version of Render, so you may get an error on your search as the server starts up. If this happens, wait about a minute and try again.
+
+Onchain credit scoring and undercollateralized lending on BNB Chain. Credence blends two independent credit signals — onchain wallet behavior across 5 blockchains and ZK-verified offchain credit attestations — into a composite score that determines collateral requirements on a continuous curve. The result: creditworthy borrowers access capital-efficient lending terms that neither traditional finance nor existing DeFi protocols can offer alone.
+
+**Credence applies battle-tested credit scoring methodology to onchain data for the first time, because the trillion-dollar lending market won't move to DeFi until DeFi can underwrite with the same rigor the real world does.**
+
+No external API keys are required. For the full live-data experience, visit the deployed demo at [credence-protocol.vercel.app](https://credence-protocol.vercel.app/). To run locally without an Allium API key, the pipeline uses cached or synthetic data with full model inference. See [docs/TECHNICAL.md](docs/TECHNICAL.md) for details.
+
+## Deployed Contracts (BSC Testnet)
+
+| Contract | Address | Verified |
+|---|---|---|
+| OffchainAttestationRegistry | [`0x7574...bf6e0`](https://testnet.bscscan.com/address/0x7574581d7D872F605FD760Bb1BAcc69a551bf6e0) | Yes |
+| CreditOracle | [`0x1625...37B7`](https://testnet.bscscan.com/address/0x16253605BEef191024C950E00D829E0D410637B7) | Yes |
+| LendingPool | [`0x159F...0edA`](https://testnet.bscscan.com/address/0x159F82bFbBc4D5f7C962b5C4667ECA0004030edA) | Yes |
+
+## Quick Start
+
+```bash
+git clone https://github.com/justinwender/credence-protocol.git && cd credence-protocol
+pip install -r pipeline/requirements.txt
+cd frontend && npm install && cd ..
+cp .env.example .env
+
+# Terminal 1: Backend
+python3 -m uvicorn pipeline.api:app --host 127.0.0.1 --port 8000
+
+# Terminal 2: Frontend
+cd frontend && npm run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000). Full setup details in [TECHNICAL.md](docs/TECHNICAL.md).
+
+## Documentation
+
+- [PROJECT.md](docs/PROJECT.md) — Project overview (start here)
+- [TECHNICAL.md](docs/TECHNICAL.md) — Architecture and reproduction instructions
+- [EXTRAS.md](docs/EXTRAS.md) — Demo video and AI build log
+- [DEEP_DIVE.md](docs/DEEP_DIVE.md) — Full technical report: model methodology, contract design rationale, composite score calibration, production considerations (optional, for those who want the details)
+
+## Team
+
+Built solo by Justin Wender. MS Economics and Data Science at Northeastern (July 2026), incoming Growth/BDR at Allium. Previously Digital Asset Research at Fireblocks and TRGC Amsterdam. [LinkedIn](https://linkedin.com/in/justinwender)
+
+## License
+
+MIT

@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: credence-protocol-api
+    runtime: python
+    rootDir: .
+    buildCommand: pip install -r pipeline/requirements.txt
+    startCommand: gunicorn pipeline.api:app -w 2 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 120
+    envVars:
+      - key: MONAD_TESTNET_RPC
+        value: https://testnet-rpc.monad.xyz
+      - key: ATTESTATION_REGISTRY_ADDRESS
+        value: 0x6B598D7dFD781e1604083Ee2a0e054d1Ef8587cf
+      - key: CREDIT_ORACLE_ADDRESS
+        value: 0xc0525BB82fEC7226dfC69fc6Be97F61162EB966E
+      - key: LENDING_POOL_ADDRESS
+        value: 0xA9A25451A6d760cFb0A21fAe3fbcD1be96f8f441
+      - key: ETHERSCAN_API_KEY
+        value: HCXT334CQ6TDECH8ACRFE7DFKSYTYEMVEF
+      - key: ARBISCAN_API_KEY
+        value: HCXT334CQ6TDECH8ACRFE7DFKSYTYEMVEF
+      # MONAD_TESTNET_PRIVATE_KEY must be set manually in Render dashboard
+      # (never commit private keys to git!)
+      - key: MONAD_TESTNET_PRIVATE_KEY
+        sync: false
